@@ -18,9 +18,9 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------------------------
 # SET PER RELEASE. The launcher image this copy of the script deploys, by digest. The release
-# job writes the digest here when it tags the script; the all-zero value is refused outside a
-# dry run.
-LAUNCHER_DIGEST="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# job prints the digest, which is written here when the script is tagged; the all-zero value is
+# refused outside a dry run.
+LAUNCHER_DIGEST="sha256:d0fc59930764bd1edbdfb26e6e2111e73aa0d6a94bd76fde6244f535dd5e1124"
 SCRIPT_VERSION="1.0.0"
 # ---------------------------------------------------------------------------------------------
 
