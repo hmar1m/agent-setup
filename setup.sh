@@ -14,14 +14,15 @@
 #     --place-key '<public key PEM, base64>' --package-repos agents[,repo...] \
 #     --executor-hosts host[,host...] [--yes] [--dry-run]
 #   bash setup.sh --remove --project P --region us-central1 [--package-repos ...]
+# Optional: --builder-account also makes the build account agent-builder@P for Cloud Build (no key).
 set -euo pipefail
 
 # ---------------------------------------------------------------------------------------------
 # SET PER RELEASE. The launcher image this copy of the script deploys, by digest. The release
 # job prints the digest, which is written here when the script is tagged; the all-zero value is
 # refused outside a dry run.
-LAUNCHER_DIGEST="sha256:d0fc59930764bd1edbdfb26e6e2111e73aa0d6a94bd76fde6244f535dd5e1124"
-SCRIPT_VERSION="1.0.0"
+LAUNCHER_DIGEST="sha256:e81de7138d2a5abf55ad49f2245f9b1095f3f467099e94851d7c139d229f8553"
+SCRIPT_VERSION="1.0.1"
 # ---------------------------------------------------------------------------------------------
 
 DEFAULT_RELEASE_REPO="us-docker.pkg.dev/veriphex-releases/public"
@@ -42,6 +43,7 @@ RUNTIME_SA_NAME="veriphex-runtime"
 LAUNCHER_SA_NAME="veriphex-launcher"
 SERVICE="veriphex-launcher"
 ROLE_ID="veriphexAgentLauncher"
+BUILDER_SA_NAME="agent-builder"
 # private.googleapis.com, and restricted.googleapis.com, which Private Google Access answers on.
 PGA_RANGES="199.36.153.8/30,199.36.153.4/30"
 PGA_ADDRESSES="199.36.153.8,199.36.153.9,199.36.153.10,199.36.153.11"
@@ -72,6 +74,7 @@ RELEASE_REPO="$DEFAULT_RELEASE_REPO"
 ASSUME_YES=0
 DRY_RUN=0
 REMOVE=0
+BUILDER=0
 
 say() { printf '%s\n' "$*"; }
 stop() { printf '\nStopped: %s\n' "$*" >&2; exit 1; }
@@ -98,6 +101,7 @@ while [ $# -gt 0 ]; do
     --yes) ASSUME_YES=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --remove) REMOVE=1; shift ;;
+    --builder-account) BUILDER=1; shift ;;
     -h|--help) usage ;;
     *) stop "unknown option $1. Run with --help to see the options." ;;
   esac
@@ -138,11 +142,22 @@ sha256_hex() {
 [ -n "$REGION" ] || stop "--region is required."
 printf '%s' "$PROJECT" | grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || stop "--project $PROJECT is not a Google Cloud project ID."
 printf '%s' "$REGION" | grep -Eq '^[a-z]+-[a-z]+[0-9]+$' || stop "--region $REGION is not a Google Cloud region."
+ZONES_GIVEN="$ZONES"
 [ -n "$ZONES" ] || ZONES="${REGION}-a,${REGION}-b,${REGION}-c"
 
 RUNTIME_SA="${RUNTIME_SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 LAUNCHER_SA="${LAUNCHER_SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 ROLE_NAME="projects/${PROJECT}/roles/${ROLE_ID}"
+BUILDER_SA="${BUILDER_SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+BUILDER_BUCKET="${PROJECT}_cloudbuild"
+[ "$BUILDER" = 0 ] || APIS="$APIS cloudbuild.googleapis.com"
+# The bucket's multi-region: the one that holds the region.
+case "$REGION" in
+  us-*|northamerica-*|southamerica-*) BUCKET_LOCATION="US" ;;
+  europe-*|me-*) BUCKET_LOCATION="EU" ;;
+  asia-*|australia-*) BUCKET_LOCATION="ASIA" ;;
+  *) BUCKET_LOCATION="$REGION" ;;
+esac
 
 # Package repositories, each as LOCATION-docker.pkg.dev/PROJECT/REPO. A bare name means a
 # repository in this project and region.
@@ -208,6 +223,11 @@ has_sa_binding() {  # sa role member
   [ -n "$(look iam service-accounts get-iam-policy "$1" --project "$PROJECT" --flatten='bindings[].members' \
     --filter="bindings.role=$2 AND bindings.members=$3" --format='value(bindings.role)')" ]
 }
+has_bucket_binding() {  # bucket role member
+  [ -n "$(look storage buckets get-iam-policy "gs://$1" --project "$PROJECT" --flatten='bindings[].members' \
+    --filter="bindings.role=$2 AND bindings.members=$3" --format='value(bindings.role)')" ]
+}
+bucket_exists() { look storage buckets describe "gs://$1" --project "$PROJECT" --format='value(name)' >/dev/null; }
 sa_exists() { look iam service-accounts describe "$1" --project "$PROJECT" --format='value(email)' >/dev/null; }
 role_exists() { look iam roles describe "$ROLE_ID" --project "$PROJECT" --format='value(name)' >/dev/null; }
 zone_exists() { look dns managed-zones describe "$1" --project "$PROJECT" --format='value(name)' >/dev/null; }
@@ -261,6 +281,26 @@ if [ "$REMOVE" = 1 ]; then
     change iam service-accounts delete "$RUNTIME_SA" --project "$PROJECT" --quiet
   fi
 
+  if [ "$BUILDER" = 1 ]; then
+    say "Build account"
+    if has_project_binding roles/logging.logWriter "serviceAccount:$BUILDER_SA"; then
+      change projects remove-iam-policy-binding "$PROJECT" --member "serviceAccount:$BUILDER_SA" --role roles/logging.logWriter --condition=None --quiet
+    fi
+    if bucket_exists "$BUILDER_BUCKET" && has_bucket_binding "$BUILDER_BUCKET" roles/storage.objectViewer "serviceAccount:$BUILDER_SA"; then
+      change storage buckets remove-iam-policy-binding "gs://$BUILDER_BUCKET" --project "$PROJECT" \
+        --member "serviceAccount:$BUILDER_SA" --role roles/storage.objectViewer
+    fi
+    for repo in $(printf '%s' "$REPO_PATHS" | tr ',' ' '); do
+      if has_repo_binding "$repo" roles/artifactregistry.writer "serviceAccount:$BUILDER_SA"; then
+        change artifacts repositories remove-iam-policy-binding "$(repo_name "$repo")" --project "$(repo_project "$repo")" \
+          --location "$(repo_loc "$repo")" --member "serviceAccount:$BUILDER_SA" --role roles/artifactregistry.writer
+      fi
+    done
+    if sa_exists "$BUILDER_SA"; then
+      change iam service-accounts delete "$BUILDER_SA" --project "$PROJECT" --quiet
+    fi
+  fi
+
   say "Network"
   if look compute network-firewall-policies describe "$FW_POLICY" --global --project "$PROJECT" --format='value(name)' >/dev/null; then
     if look compute network-firewall-policies associations list --firewall-policy "$FW_POLICY" --global-firewall-policy \
@@ -296,7 +336,7 @@ if [ "$REMOVE" = 1 ]; then
   fi
 
   say ""
-  say "Removed. The package repositories and the APIs were left as they were: they hold your own"
+  say "Removed. The package repositories, the APIs and the bucket gs://$BUILDER_BUCKET were left as they were: they hold your own"
   say "packages and may serve other work. Delete a repository yourself with"
   say "  gcloud artifacts repositories delete REPO --location LOCATION --project $PROJECT"
   say "Then remove the place in Veriphex: AI apps and agents → Where agents run."
@@ -346,6 +386,15 @@ if [ -n "$missing" ]; then
 else
   say "   already enabled"
 fi
+
+# --- Zones -------------------------------------------------------------------------------------
+# The launcher tries the zones in order and moves on when one has no machine free. Zone f joins
+# the default list where it offers the machine type (us-central1-f does; most regions have no f).
+if [ -z "$ZONES_GIVEN" ] && look compute machine-types describe "$MACHINE_TYPE" --zone "${REGION}-f" \
+    --project "$PROJECT" --format='value(name)' | grep -qx "$MACHINE_TYPE"; then
+  ZONES="${ZONES},${REGION}-f"
+fi
+say "   Zones: $ZONES"
 
 # --- Confidential VM quota -------------------------------------------------------------------
 family="$(printf '%s' "${MACHINE_TYPE%%-*}" | tr '[:lower:]' '[:upper:]')"
@@ -499,6 +548,30 @@ if ! has_sa_binding "$RUNTIME_SA" roles/iam.serviceAccountUser "serviceAccount:$
     --member "serviceAccount:$LAUNCHER_SA" --role roles/iam.serviceAccountUser
 fi
 
+# --- Build account (optional) ----------------------------------------------------------------
+if [ "$BUILDER" = 1 ]; then
+  say "Build account $BUILDER_SA"
+  if ! sa_exists "$BUILDER_SA"; then
+    change iam service-accounts create "$BUILDER_SA_NAME" --project "$PROJECT" --display-name "Agent image builds (Cloud Build)"
+  fi
+  for repo in $(printf '%s' "$REPO_PATHS" | tr ',' ' '); do
+    if ! has_repo_binding "$repo" roles/artifactregistry.writer "serviceAccount:$BUILDER_SA"; then
+      change artifacts repositories add-iam-policy-binding "$(repo_name "$repo")" --project "$(repo_project "$repo")" \
+        --location "$(repo_loc "$repo")" --member "serviceAccount:$BUILDER_SA" --role roles/artifactregistry.writer
+    fi
+  done
+  if ! has_project_binding roles/logging.logWriter "serviceAccount:$BUILDER_SA"; then
+    change projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$BUILDER_SA" --role roles/logging.logWriter --condition=None
+  fi
+  if ! bucket_exists "$BUILDER_BUCKET"; then
+    change storage buckets create "gs://$BUILDER_BUCKET" --project "$PROJECT" --location "$BUCKET_LOCATION" --uniform-bucket-level-access
+  fi
+  if ! bucket_exists "$BUILDER_BUCKET" || ! has_bucket_binding "$BUILDER_BUCKET" roles/storage.objectViewer "serviceAccount:$BUILDER_SA"; then
+    change storage buckets add-iam-policy-binding "gs://$BUILDER_BUCKET" --project "$PROJECT" \
+      --member "serviceAccount:$BUILDER_SA" --role roles/storage.objectViewer
+  fi
+fi
+
 # --- 5. Launcher -----------------------------------------------------------------------------
 say "5. Launcher $SERVICE"
 say ""
@@ -543,7 +616,7 @@ if [ -n "$url" ] && [ "$current_label" = "$label" ]; then
 else
   change run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" --image "$LAUNCHER_IMAGE" \
     --service-account "$LAUNCHER_SA" --no-invoker-iam-check --ingress all \
-    --min-instances 0 --max-instances 3 --cpu 1 --memory 512Mi \
+    --min-instances 0 --max-instances 3 --cpu 1 --memory 512Mi --timeout 180 \
     --env-vars-file "$env_file" --labels "veriphex-config=$label,veriphex-org=$ORG" --quiet
   show_env
   url="$(service_url)"

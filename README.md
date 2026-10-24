@@ -32,7 +32,8 @@ Every name starts with `veriphex`.
    `compute.subnetworks.use` and `compute.zoneOperations.get`. The launcher may act as
    `veriphex-runtime` only (`roles/iam.serviceAccountUser` on that one account).
 5. **Cloud Run service `veriphex-launcher`**, from Veriphex's launcher image by digest, running as
-   `veriphex-launcher@`, with no minimum instances and one CPU.
+   `veriphex-launcher@`, with no minimum instances, one CPU and a 180-second request timeout
+   (a start may spend up to 100 seconds trying zones).
 
    The launcher's address is public, and authenticated only by Veriphex's signature. Its code
    refuses everything unsigned and can only start Veriphex's runtime.
@@ -40,6 +41,15 @@ Every name starts with `veriphex`.
    It starts machines only from Veriphex's runtime image, only for packages in the repositories
    you named, only with names starting `vpx-`, and each machine deletes itself when its time is
    up. Every request it receives is in your own Cloud Logging.
+
+With `--builder-account` the script also makes the account your builders use to build agent images
+with Cloud Build when they have no Docker (see `GUIDE.md`):
+- it enables `cloudbuild.googleapis.com`;
+- **Service account `agent-builder@<project>`**, with no key, holding `roles/artifactregistry.writer` on
+  each repository you name in `--package-repos` only, `roles/logging.logWriter` on the project, and
+  `roles/storage.objectViewer` on `gs://<project>_cloudbuild` only;
+- it creates that bucket (uniform access, in the region's multi-region) if it is absent, so the
+  binding has a target.
 
 If a repository you name does not exist in this project, the script offers to create it.
 
@@ -80,10 +90,11 @@ It stops, naming the cause and the fix, when:
 | `--executor-hosts` | Veriphex executor hosts, comma-separated (required) |
 | `--control-plane-hosts` | default `proxyme-hszn.onrender.com` |
 | `--machine-type` | default `n2d-standard-2` |
-| `--zones` | default `<region>-a,<region>-b,<region>-c`, tried in order |
+| `--zones` | default `<region>-a,<region>-b,<region>-c`, and `<region>-f` when that zone offers the machine type; tried in order |
 | `--launcher-image` | default: this release's launcher, by digest |
 | `--release-repo` | default `us-docker.pkg.dev/veriphex-releases/public` |
 | `--launcher-url-hint` | the launcher's address, if already known |
+| `--builder-account` | also create the Cloud Build account `agent-builder` and its three grants (optional) |
 | `--yes` | answer yes to every question |
 | `--dry-run` | print what would change; change nothing |
 | `--remove` | undo everything the script made |
@@ -96,6 +107,7 @@ bash setup.sh --remove --project <PROJECT> --region <REGION> --package-repos <re
 
 This deletes any running agent machines, the launcher, the custom role, both service accounts,
 the firewall policy, the DNS zones, the NAT, the router, the subnet and the network, and removes
-the runtime account's read access from the repositories you name. It leaves your package
+the runtime account's read access from the repositories you name. With `--builder-account` it also
+removes the `agent-builder` bindings and account; the `gs://<project>_cloudbuild` bucket stays. It leaves your package
 repositories and the APIs as they are, because they hold your own packages and may serve other
 work. Then remove the place in Veriphex.
