@@ -22,7 +22,7 @@ set -euo pipefail
 # job prints the digest, which is written here when the script is tagged; the all-zero value is
 # refused outside a dry run.
 LAUNCHER_DIGEST="sha256:e81de7138d2a5abf55ad49f2245f9b1095f3f467099e94851d7c139d229f8553"
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 # ---------------------------------------------------------------------------------------------
 
 DEFAULT_RELEASE_REPO="us-docker.pkg.dev/veriphex-releases/public"
@@ -230,6 +230,12 @@ has_bucket_binding() {  # bucket role member
 bucket_exists() { look storage buckets describe "gs://$1" --project "$PROJECT" --format='value(name)' >/dev/null; }
 sa_exists() { look iam service-accounts describe "$1" --project "$PROJECT" --format='value(email)' >/dev/null; }
 role_exists() { look iam roles describe "$ROLE_ID" --project "$PROJECT" --format='value(name)' >/dev/null; }
+# Whether the policy carries the association. gcloud has no `associations list` for a global network
+# firewall policy; the policy's own description lists its associations, separated by ';'.
+fw_associated() {
+  look compute network-firewall-policies describe "$FW_POLICY" --global --project "$PROJECT" \
+    --format='value(associations[].name)' | tr ';' '\n' | grep -qx "$FW_ASSOC"
+}
 zone_exists() { look dns managed-zones describe "$1" --project "$PROJECT" --format='value(name)' >/dev/null; }
 record_exists() { [ -n "$(look dns record-sets list --zone "$1" --project "$PROJECT" --name "$2" --type "$3" --format='value(name)')" ]; }
 
@@ -303,8 +309,7 @@ if [ "$REMOVE" = 1 ]; then
 
   say "Network"
   if look compute network-firewall-policies describe "$FW_POLICY" --global --project "$PROJECT" --format='value(name)' >/dev/null; then
-    if look compute network-firewall-policies associations list --firewall-policy "$FW_POLICY" --global-firewall-policy \
-         --project "$PROJECT" --format='value(name)' | grep -qx "$FW_ASSOC"; then
+    if fw_associated; then
       change compute network-firewall-policies associations delete --firewall-policy "$FW_POLICY" --name "$FW_ASSOC" \
         --global-firewall-policy --project "$PROJECT"
     fi
@@ -516,8 +521,7 @@ if ! rule_exists 65001; then
   change compute network-firewall-policies rules create 65001 --firewall-policy "$FW_POLICY" --global-firewall-policy --project "$PROJECT" \
     --direction INGRESS --action deny --layer4-configs all --src-ip-ranges 0.0.0.0/0 --description "Everything in"
 fi
-if ! look compute network-firewall-policies associations list --firewall-policy "$FW_POLICY" --global-firewall-policy \
-     --project "$PROJECT" --format='value(name)' | grep -qx "$FW_ASSOC"; then
+if ! fw_associated; then
   change compute network-firewall-policies associations create --firewall-policy "$FW_POLICY" --network "$NETWORK" \
     --name "$FW_ASSOC" --global-firewall-policy --project "$PROJECT"
 fi
